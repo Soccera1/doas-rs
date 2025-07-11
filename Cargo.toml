@@ -1,0 +1,9 @@
+[package]
+name = "doas"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+pam = "0.8"
+rpassword = "7"
+nix = { version = "0.30", features = ["user"] }
