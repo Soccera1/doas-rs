@@ -13,10 +13,10 @@ use pam::Client;
 use rpassword;
 use termios::{Termios, TCSANOW, ICANON, ECHO};
 use scopeguard::guard;
-use libc; // Re-added for ttyname_r
+use libc;
 
 const PERSIST_DIR: &str = "/var/run/doas";
-const PERSIST_TIMEOUT_SECS: u64 = 300; // 5 minutes
+const PERSIST_TIMEOUT_SECS: u64 = 300;
 
 #[derive(Debug, Clone, PartialEq)]
 enum RuleAction {
@@ -256,7 +256,6 @@ fn prompt_password() -> String {
             termios::tcsetattr(0, TCSANOW, &original_termios).expect("failed to restore terminal attributes");
         });
 
-
         for c in stdin.bytes() {
             match c {
                 Ok(b'\n') | Ok(b'\r') => {
@@ -382,7 +381,6 @@ fn update_persist_token(persist_file_path: &Path) {
     if debug { eprintln!("DEBUG: Persist token UPDATED at {:?}", persist_file_path); }
 }
 
-
 fn main() {
     let debug = env::var("DOAS_DEBUG").is_ok();
 
@@ -392,6 +390,12 @@ fn main() {
     }
 
     let args: Vec<String> = env::args().collect();
+
+    if args.len() == 2 && (args[1] == "--version" || args[1] == "-v") {
+        println!("doas-rs 0.1.1");
+        std::process::exit(0);
+    }
+
     if args.len() < 2 {
         eprintln!("usage: doas [-s] [-u user] command [args...]");
         std::process::exit(1);
@@ -455,7 +459,6 @@ fn main() {
             let mut authenticated = false;
             let persist_file_path_opt = get_persist_file_path(&current_user);
 
-            // First, check for persist token
             if persist {
                 if let Some(ref pfp) = persist_file_path_opt {
                     authenticated = check_persist_token(pfp);
@@ -464,20 +467,17 @@ fn main() {
                 }
             }
             
-            // If not authenticated by token, check nopass rule
             if !authenticated && nopass {
                 authenticated = true;
                 if debug { eprintln!("DEBUG: Authenticated via nopass."); }
             }
 
-            // If still not authenticated, prompt for password
             if !authenticated {
                 if debug { eprintln!("DEBUG: Prompting for authentication."); }
                 for attempt in 0..3 {
                     if authenticate_user(&current_user) {
                         authenticated = true;
                         if debug { eprintln!("DEBUG: Authentication successful."); }
-                        // ONLY UPDATE PERSIST TOKEN HERE, AFTER A FRESH PASSWORD AUTH!
                         if persist {
                             if let Some(ref pfp) = persist_file_path_opt {
                                 update_persist_token(pfp);
