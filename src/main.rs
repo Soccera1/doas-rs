@@ -1,12 +1,22 @@
 use std::env;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Write, Read};
 use std::os::unix::process::CommandExt;
 use std::process::Command;
+use std::time::{SystemTime, Duration};
+use std::path::{Path, PathBuf};
+use std::hash::Hasher;
+use rustc_hash::FxHasher;
 
 use nix::unistd::{setgid, setuid, Gid, Uid, getuid, User};
 use pam::Client;
 use rpassword;
+use termios::{Termios, TCSANOW, ICANON, ECHO};
+use scopeguard::guard;
+use libc; // Re-added for ttyname_r
+
+const PERSIST_DIR: &str = "/var/run/doas";
+const PERSIST_TIMEOUT_SECS: u64 = 300; // 5 minutes
 
 #[derive(Debug, Clone, PartialEq)]
 enum RuleAction {
@@ -22,10 +32,11 @@ struct Rule {
     args: Option<Vec<String>>,
     action: RuleAction,
     persist: bool,
+    nopass: bool,
 }
 
 enum RuleMatch {
-    Permitted { target: String, persist: bool },
+    Permitted { target: String, persist: bool, nopass: bool },
     Denied,
 }
 
@@ -59,39 +70,96 @@ fn parse_config(config: &str) -> Vec<Rule> {
             if line.is_empty() || line.starts_with('#') {
                 return None;
             }
-            let mut parts = line.split_whitespace();
+            let parts: Vec<&str> = line.split_whitespace().collect();
 
-            let action_str = parts.next()?;
-            let action = match action_str {
-                "permit" => RuleAction::Permit,
-                "deny" => RuleAction::Deny,
-                _ => return None,
-            };
+            if parts.is_empty() {
+                return None;
+            }
 
-            let user = parts.next()?.to_string();
-
+            let action: RuleAction;
+            let mut user_str = String::new();
             let mut target = None;
             let mut cmd = None;
             let mut args = None;
             let mut persist = false;
+            let mut nopass = false;
 
-            while let Some(token) = parts.next() {
-                match token {
-                    "as" => target = parts.next().map(|s| s.to_string()),
-                    "cmd" => cmd = parts.next().map(|s| s.to_string()),
-                    "args" => args = parts.next().map(|s| vec![s.to_string()]),
-                    "persist" => persist = true,
-                    _ => {}
+            let mut i = 0;
+
+            if let Some(action_token) = parts.get(i) {
+                action = match *action_token {
+                    "permit" => RuleAction::Permit,
+                    "deny" => RuleAction::Deny,
+                    _ => {
+                        eprintln!("doas: warning: invalid action '{action_token}' in config line: {}", line);
+                        return None;
+                    },
+                };
+                i += 1;
+            } else {
+                return None;
+            }
+
+            while i < parts.len() {
+                match parts[i] {
+                    "persist" => {
+                        persist = true;
+                    },
+                    "nopass" => {
+                        nopass = true;
+                    },
+                    "as" => {
+                        i += 1;
+                        if let Some(target_token) = parts.get(i) {
+                            target = Some(target_token.to_string());
+                        } else {
+                            eprintln!("doas: warning: 'as' without target in config line: {}", line);
+                            return None;
+                        }
+                    },
+                    "cmd" => {
+                        i += 1;
+                        if let Some(cmd_token) = parts.get(i) {
+                            cmd = Some(cmd_token.to_string());
+                        } else {
+                            eprintln!("doas: warning: 'cmd' without command in config line: {}", line);
+                            return None;
+                        }
+                    },
+                    "args" => {
+                        i += 1;
+                        if i < parts.len() {
+                            args = Some(parts[i..].iter().map(|s| s.to_string()).collect());
+                            break;
+                        } else {
+                            eprintln!("doas: warning: 'args' without arguments in config line: {}", line);
+                            return None;
+                        }
+                    },
+                    _ => {
+                        if user_str.is_empty() {
+                            user_str = parts[i].to_string();
+                        } else {
+                            eprintln!("doas: warning: unrecognized token or misplaced user '{:?}' in config line: {}", parts[i], line);
+                        }
+                    },
                 }
+                i += 1;
+            }
+
+            if user_str.is_empty() {
+                eprintln!("doas: warning: rule missing user/group in config line: {}", line);
+                return None;
             }
 
             Some(Rule {
-                user,
+                user: user_str,
                 target,
                 cmd,
                 args,
                 action,
                 persist,
+                nopass,
             })
         })
         .collect()
@@ -100,7 +168,7 @@ fn parse_config(config: &str) -> Vec<Rule> {
 fn evaluate_rules(
     rules: &[Rule],
     current_user: &str,
-    _groups: &[String],
+    groups: &[String],
     target: Option<&str>,
     command_args: &[String],
 ) -> RuleMatch {
@@ -108,6 +176,7 @@ fn evaluate_rules(
 
     if debug {
         eprintln!("DEBUG: current_user = {:?}", current_user);
+        eprintln!("DEBUG: groups = {:?}", groups);
         eprintln!("DEBUG: target = {:?}", target);
         eprintln!("DEBUG: command_args = {:?}", command_args);
     }
@@ -119,23 +188,36 @@ fn evaluate_rules(
             eprintln!("DEBUG: checking rule = {:?}", rule);
         }
 
-        if rule.user != current_user {
+        let user_matches = rule.user == current_user;
+        let group_matches = rule.user.starts_with(':') && groups.contains(&rule.user[1..].to_string());
+
+        if !(user_matches || group_matches) {
+            if debug { eprintln!("DEBUG: User/group mismatch: rule_user={:?}, current_user={:?}, groups={:?}", rule.user, current_user, groups); }
             continue;
         }
+
         if let Some(ref tgt) = rule.target {
             if Some(tgt.as_str()) != target {
+                if debug { eprintln!("DEBUG: Target mismatch: rule_target={:?}, actual_target={:?}", tgt, target); }
                 continue;
             }
+        } else {
+            if debug { eprintln!("DEBUG: Rule has no target, allows any."); }
         }
+
         if let Some(ref c) = rule.cmd {
             if command_args.is_empty() || &command_args[0] != c {
+                if debug { eprintln!("DEBUG: Command mismatch: rule_cmd={:?}, actual_cmd={:?}", c, command_args.first()); }
                 continue;
             }
             if let Some(ref expected_args) = rule.args {
                 if &command_args[1..] != expected_args.as_slice() {
+                    if debug { eprintln!("DEBUG: Args mismatch: rule_args={:?}, actual_args={:?}", expected_args, &command_args[1..]); }
                     continue;
                 }
             }
+        } else {
+            if debug { eprintln!("DEBUG: Rule has no command, matches any command."); }
         }
 
         last_match = Some(rule);
@@ -146,6 +228,7 @@ fn evaluate_rules(
             RuleAction::Permit => RuleMatch::Permitted {
                 target: target.unwrap_or("root").to_string(),
                 persist: rule.persist,
+                nopass: rule.nopass,
             },
             RuleAction::Deny => RuleMatch::Denied,
         }
@@ -155,9 +238,61 @@ fn evaluate_rules(
 }
 
 fn prompt_password() -> String {
+    let mut password = String::new();
+    let stdin = io::stdin();
+    let mut stdout = io::stdout();
+
     print!("\x1b[31m[AUTH]\x1b[0m Password: ");
-    io::stdout().flush().unwrap();
-    rpassword::read_password().unwrap_or_default()
+    stdout.flush().unwrap();
+
+    let maybe_termios = Termios::from_fd(0);
+
+    if let Ok(mut termios) = maybe_termios {
+        let original_termios = termios;
+        termios.c_lflag &= !(ICANON | ECHO);
+        termios::tcsetattr(0, TCSANOW, &termios).expect("failed to set terminal attributes");
+
+        let _restore_termios = guard(original_termios, |original_termios| {
+            termios::tcsetattr(0, TCSANOW, &original_termios).expect("failed to restore terminal attributes");
+        });
+
+
+        for c in stdin.bytes() {
+            match c {
+                Ok(b'\n') | Ok(b'\r') => {
+                    break;
+                },
+                Ok(127) => {
+                    if !password.is_empty() {
+                        password.pop();
+                        print!("\x08 \x08");
+                        stdout.flush().unwrap();
+                    }
+                },
+                Ok(byte) => {
+                    if let Some(ch) = char::from_u32(byte as u32) {
+                        password.push(ch);
+                        print!("*");
+                        stdout.flush().unwrap();
+                    }
+                },
+                Err(_) => break,
+            }
+        }
+        println!();
+        print!("\r");
+        for _ in 0..(password.len() + "[AUTH] Password: ".len() + "\x1b[31m\x1b[0m".len()) {
+            print!(" ");
+        }
+        print!("\r");
+        stdout.flush().unwrap();
+
+    } else {
+        eprintln!("doas: warning: could not configure terminal for asterisk echo, falling back to no-echo.");
+        return rpassword::read_password().unwrap_or_default();
+    }
+
+    password
 }
 
 fn authenticate_user(user: &str) -> bool {
@@ -168,7 +303,89 @@ fn authenticate_user(user: &str) -> bool {
     client.authenticate().is_ok() && client.open_session().is_ok()
 }
 
+fn get_tty_name_hash() -> Option<String> {
+    let debug = env::var("DOAS_DEBUG").is_ok();
+    let mut buf = [0 as libc::c_char; 256];
+    let tty_fd = libc::STDIN_FILENO;
+
+    unsafe {
+        let result = libc::ttyname_r(tty_fd, buf.as_mut_ptr(), buf.len());
+        if result == 0 {
+            let c_str = std::ffi::CStr::from_ptr(buf.as_ptr());
+            let tty_str = c_str.to_string_lossy().into_owned();
+            if debug { eprintln!("DEBUG: Current TTY: {:?}", tty_str); }
+
+            let mut hasher = FxHasher::default();
+            hasher.write(tty_str.as_bytes());
+            Some(format!("{:x}", hasher.finish()))
+        } else {
+            if debug { eprintln!("DEBUG: Could not get TTY name (errno: {}).", result); }
+            None
+        }
+    }
+}
+
+fn get_persist_file_path(user: &str) -> Option<PathBuf> {
+    let debug = env::var("DOAS_DEBUG").is_ok();
+    if let Some(tty_hash) = get_tty_name_hash() {
+        let persist_file_name = format!("{}-{}", user, tty_hash);
+        Some(Path::new(PERSIST_DIR).join(persist_file_name))
+    } else {
+        if debug { eprintln!("doas: warning: persist requested but could not determine TTY for token file."); }
+        None
+    }
+}
+
+fn check_persist_token(persist_file_path: &Path) -> bool {
+    let debug = env::var("DOAS_DEBUG").is_ok();
+    let now = SystemTime::now();
+
+    if persist_file_path.exists() {
+        if let Ok(metadata) = fs::metadata(&persist_file_path) {
+            if let Ok(modified) = metadata.modified() {
+                let duration_since_modified = now.duration_since(modified).unwrap_or_default();
+                if debug { eprintln!("DEBUG: Persist file modified: {:?}, Duration since modified: {:?}", modified, duration_since_modified); }
+                if duration_since_modified < Duration::from_secs(PERSIST_TIMEOUT_SECS) {
+                    if debug { eprintln!("DEBUG: Persist token is VALID."); }
+                    return true;
+                } else {
+                    if debug { eprintln!("DEBUG: Persist token is EXPIRED."); }
+                    let _ = fs::remove_file(persist_file_path).map_err(|e| { if debug { eprintln!("doas: warning: could not remove expired persist file {}: {e}", persist_file_path.display()); }});
+                }
+            } else {
+                if debug { eprintln!("DEBUG: Could not get modified timestamp for persist file."); }
+            }
+        } else {
+            if debug { eprintln!("DEBUG: Could not get metadata for persist file."); }
+        }
+    } else {
+        if debug { eprintln!("DEBUG: Persist file does not exist."); }
+    }
+    false
+}
+
+fn update_persist_token(persist_file_path: &Path) {
+    let debug = env::var("DOAS_DEBUG").is_ok();
+    let _ = fs::create_dir_all(PERSIST_DIR).map_err(|e| { if debug { eprintln!("doas: warning: could not create persist directory: {e}"); }});
+    let _ = fs::File::create(persist_file_path)
+        .and_then(|file| {
+            #[cfg(target_os = "linux")]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut perms = file.metadata()?.permissions();
+                perms.set_mode(0o600);
+                file.set_permissions(perms)?;
+            }
+            Ok(())
+        })
+        .map_err(|e| { if debug { eprintln!("doas: warning: could not update persist file {}: {e}", persist_file_path.display()); }});
+    if debug { eprintln!("DEBUG: Persist token UPDATED at {:?}", persist_file_path); }
+}
+
+
 fn main() {
+    let debug = env::var("DOAS_DEBUG").is_ok();
+
     if !is_setuid_root() {
         eprintln!("doas: not installed setuid");
         std::process::exit(1);
@@ -234,26 +451,58 @@ fn main() {
     );
 
     match rule_match {
-        RuleMatch::Permitted { target, persist } => {
-            for attempt in 0..3 {
-                if authenticate_user(&current_user) {
-                    break;
+        RuleMatch::Permitted { target, persist, nopass } => {
+            let mut authenticated = false;
+            let persist_file_path_opt = get_persist_file_path(&current_user);
+
+            // First, check for persist token
+            if persist {
+                if let Some(ref pfp) = persist_file_path_opt {
+                    authenticated = check_persist_token(pfp);
                 } else {
-                    eprintln!("doas: authentication failed");
-                    if attempt == 2 {
-                        std::process::exit(1);
+                    if debug { eprintln!("doas: warning: persist requested but could not determine TTY for token file. Authentication always required."); }
+                }
+            }
+            
+            // If not authenticated by token, check nopass rule
+            if !authenticated && nopass {
+                authenticated = true;
+                if debug { eprintln!("DEBUG: Authenticated via nopass."); }
+            }
+
+            // If still not authenticated, prompt for password
+            if !authenticated {
+                if debug { eprintln!("DEBUG: Prompting for authentication."); }
+                for attempt in 0..3 {
+                    if authenticate_user(&current_user) {
+                        authenticated = true;
+                        if debug { eprintln!("DEBUG: Authentication successful."); }
+                        // ONLY UPDATE PERSIST TOKEN HERE, AFTER A FRESH PASSWORD AUTH!
+                        if persist {
+                            if let Some(ref pfp) = persist_file_path_opt {
+                                update_persist_token(pfp);
+                            }
+                        }
+                        break;
+                    } else {
+                        eprintln!("doas: authentication failed");
+                        if attempt == 2 {
+                            std::process::exit(1);
+                        }
                     }
                 }
             }
 
-            if persist {
-                eprintln!("Warning: persist option enabled but not implemented");
+            if !authenticated {
+                eprintln!("doas: authentication failed.");
+                std::process::exit(1);
             }
 
+            let mut command_builder = Command::new(&command_args[0]);
+            command_builder.args(&command_args[1..]);
+
             drop_privileges(&target);
-            let err = Command::new(&command_args[0])
-                .args(&command_args[1..])
-                .exec();
+            let err = command_builder.exec();
             eprintln!("doas: exec failed: {err}");
             std::process::exit(1);
         }

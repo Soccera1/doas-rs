@@ -1,10 +1,11 @@
 BINARY := target/release/doas
 DEST := /usr/local/bin/doas
+LIBCLANG_PATH ?= /usr/lib/llvm/20/lib64
 
 .PHONY: all install clean
 
 all:
-	cargo build --release
+	LIBCLANG_PATH=$(LIBCLANG_PATH) cargo build --release
 
 install:
 	cp $(BINARY) $(DEST)

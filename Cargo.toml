@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+nix = { version = "0.28", features = ["user"] }
 pam = "0.8"
 rpassword = "7"
-nix = { version = "0.30", features = ["user"] }
+termios = "0.3"
+scopeguard = "1.2"
+libc = "0.2"
+rustc-hash = "1.1"
