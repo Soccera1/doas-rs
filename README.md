@@ -31,3 +31,4 @@ you might need to set LIBCLANG_PATH if the build fails:
 export LIBCLANG_PATH=/usr/lib/llvm/20/lib64
 ```
 
+I did get written permission from coast to add the GPL-2.0 for their code and my code is licensed under the same
