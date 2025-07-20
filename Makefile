@@ -1,5 +1,5 @@
 BINARY := target/release/doas
-DEST := /usr/local/bin/doas
+DEST := /usr/local/bin/doas-rs
 MANPAGE := doas.1.gz
 MANDIR := /usr/share/man/man1
 LIBCLANG_PATH ?= /usr/lib/llvm/20/lib64
